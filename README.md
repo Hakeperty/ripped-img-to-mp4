@@ -22,10 +22,18 @@ H.264 (x264) `High` profile, yuv420p, `+faststart`, AAC 320 kbps audio (all audi
 | High | medium | 18 |
 | Quick | veryfast | 21 |
 
-DVD video is de-interlaced only where flagged interlaced, and non-square pixels are corrected to the right aspect ratio. Disc images are read directly (no mounting, no admin rights). A temporary copy of the title is made, so keep free space about equal to the title size.
+DVD video is de-interlaced only where flagged interlaced, and non-square pixels are corrected to the right aspect ratio.
+
+## Behind the scenes: the pass-through pipeline
+
+Disc images are read directly (no mounting, no admin rights) and the title is **streamed from the image straight into ffmpeg** – no temporary full copy, so no extra disk space is needed. The same pipeline gives you:
+
+- **Several titles at once** – Ctrl/Shift-click titles (or *Select all*); they are queued and saved as `name - title 1.mp4`, `name - title 2.mp4`…
+- **Blu-ray playlists** – movies split across several `.m2ts` files are stitched in the correct order using the disc's own playlist (`.mpls`) files.
+- **Subtitles** – pick a detected track on the Estimate tab and it is burned into the picture (works for DVD and Blu-ray bitmap subtitles).
+- **Estimates without extracting** – speed and size come from a short sample cut from the middle of the title.
 
 ## Limits
 
-- Copy-protected (still encrypted) discs are not supported – rip/decrypt first.
-- Only one title per run (pick another in the *Movie / title* list and run again). Blu-ray playlists that split a movie across several `.m2ts` files are not stitched.
-- Subtitles and menus are not included.
+- Copy-protected (still encrypted) discs are not supported – this tool doesn't bypass disc encryption, so use an image that is already decrypted.
+- Menus and extras beyond the listed titles are not included. Subtitle burn-in has not been tested against a real disc yet.

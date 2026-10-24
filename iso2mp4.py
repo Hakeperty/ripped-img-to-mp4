@@ -5,6 +5,7 @@ Three tabs: Upload -> Estimate -> Convert.  Needs ffmpeg (bundled in the .exe bu
 auto-downloaded on Windows if missing) and pycdlib (pure Python, reads the image directly,
 no mounting or admin rights needed).
 """
+import io
 import json
 import os
 import queue
@@ -28,6 +29,8 @@ FFMPEG_URL = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
 USER_BIN = Path.home() / ".iso2mp4" / "bin"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 SAMPLE_SECONDS = 20
+SAMPLE_MB = 24
+HEAD_MB = 32
 
 # label -> (x264 preset, crf)
 QUALITY = {
@@ -88,6 +91,7 @@ class Candidate:
     size: int
     fs: str                      # 'iso_path' | 'udf_path' | 'joliet_path' | 'plain'
     entries: list = field(default_factory=list)   # paths inside the image (or the file itself)
+    sizes: list = field(default_factory=list)     # byte size of each entry
 
 
 def human_size(n):
@@ -114,27 +118,63 @@ def _list_files(iso, fs):
             yield path, size
 
 
-def _candidates_from_files(files, fs):
-    dvd, bd, other = {}, [], []
+def parse_mpls(data):
+    """Return (clip names in play order, total seconds) from a Blu-ray .mpls playlist."""
+    if data[:4] != b"MPLS":
+        raise ValueError("not a playlist")
+    pos = int.from_bytes(data[8:12], "big") + 10
+    count = int.from_bytes(data[pos - 4:pos - 2], "big")
+    clips, ticks = [], 0
+    for _ in range(count):
+        length = int.from_bytes(data[pos:pos + 2], "big")
+        clips.append(data[pos + 2:pos + 7].decode("ascii"))
+        ticks += int.from_bytes(data[pos + 18:pos + 22], "big") - int.from_bytes(data[pos + 14:pos + 18], "big")
+        pos += length + 2
+    return clips, ticks / 45000
+
+
+def _candidates_from_files(iso, files, fs):
+    dvd, bd, other, playlists = {}, {}, [], []
     for path, size in files:
         clean = re.sub(r";\d+$", "", path).upper()
         m = re.search(r"/VIDEO_TS/VTS_(\d+)_(\d+)\.VOB$", clean)
         if m and int(m.group(2)) > 0:                      # _0 is the menu
             dvd.setdefault(int(m.group(1)), []).append((int(m.group(2)), path, size))
         elif re.search(r"/BDMV/STREAM/[^/]+\.M2TS$", clean):
-            bd.append((path, size))
+            bd[clean] = (path, size)
+        elif clean.endswith(".MPLS") and "/BDMV/PLAYLIST/" in clean:
+            playlists.append(path)
         elif os.path.splitext(clean)[1].lower() in VIDEO_EXTS and size > 5 << 20:
             other.append((path, size))
     cands = []
     for n, parts in sorted(dvd.items()):
         parts.sort()
-        total = sum(p[2] for p in parts)
-        cands.append(Candidate(f"DVD title set {n}  ({human_size(total)})", total, fs, [p[1] for p in parts]))
-    for path, size in bd:
-        if size > 100 << 20:
-            cands.append(Candidate(f"Blu-ray {path.rsplit('/', 1)[-1]}  ({human_size(size)})", size, fs, [path]))
+        sizes = [p[2] for p in parts]
+        cands.append(Candidate(f"DVD title set {n}  ({human_size(sum(sizes))})", sum(sizes), fs,
+                               [p[1] for p in parts], sizes))
+    seen = set()
+    for pl in playlists:                                   # real playlists stitch split movies in order
+        try:
+            buf = io.BytesIO()
+            iso.get_file_from_iso_fp(buf, **{fs: pl})
+            clips, seconds = parse_mpls(buf.getvalue())
+            items = [bd["/BDMV/STREAM/%s.M2TS" % c.upper()] for c in clips]
+        except (ValueError, KeyError, IndexError):
+            continue
+        if seconds < 180 or tuple(clips) in seen:
+            continue
+        seen.add(tuple(clips))
+        total = sum(i[1] for i in items)
+        name = pl.rsplit("/", 1)[-1]
+        cands.append(Candidate(f"Blu-ray playlist {name}  ({human_time(seconds)}, {len(clips)} clip(s))",
+                               total, fs, [i[0] for i in items], [i[1] for i in items]))
+    if not seen:
+        for path, size in bd.values():
+            if size > 100 << 20:
+                cands.append(Candidate(f"Blu-ray {path.rsplit('/', 1)[-1]}  ({human_size(size)})",
+                                       size, fs, [path], [size]))
     for path, size in other:
-        cands.append(Candidate(f"{path.rsplit('/', 1)[-1]}  ({human_size(size)})", size, fs, [path]))
+        cands.append(Candidate(f"{path.rsplit('/', 1)[-1]}  ({human_size(size)})", size, fs, [path], [size]))
     cands.sort(key=lambda c: -c.size)                      # biggest (the movie) first
     return cands
 
@@ -144,7 +184,7 @@ def scan_input(path):
     ext = os.path.splitext(path)[1].lower()
     if ext in VIDEO_EXTS:
         size = os.path.getsize(path)
-        return [Candidate(f"{os.path.basename(path)}  ({human_size(size)})", size, "plain", [path])]
+        return [Candidate(f"{os.path.basename(path)}  ({human_size(size)})", size, "plain", [path], [size])]
     import pycdlib
     iso = pycdlib.PyCdlib()
     iso.open(path)
@@ -157,7 +197,7 @@ def scan_input(path):
         views = views[1:] + views[:1] if len(views) > 1 else views  # UDF first: Blu-ray is UDF only
         for fs in views:
             try:
-                cands = _candidates_from_files(list(_list_files(iso, fs)), fs)
+                cands = _candidates_from_files(iso, list(_list_files(iso, fs)), fs)
             except Exception:
                 continue
             if cands:
@@ -167,54 +207,45 @@ def scan_input(path):
     raise RuntimeError("No video found in this image. Is it a DVD or Blu-ray rip?")
 
 
-class _ProgressWriter:
-    """File wrapper that reports bytes written and aborts when cancelled."""
-
-    def __init__(self, fp, total, progress, cancel):
-        self.fp, self.total, self.progress, self.cancel, self.done = fp, max(total, 1), progress, cancel, 0
-
-    def write(self, data):
-        if self.cancel.is_set():
-            raise Cancelled()
-        self.fp.write(data)
-        self.done += len(data)
-        self.progress(min(self.done / self.total, 1.0))
-
-
-def extract(image, cand, dest_dir, progress, cancel):
-    """Copy the chosen title out of the image into one file. progress(fraction)."""
-    if cand.fs == "plain":
-        return cand.entries[0]
+def iter_chunks(image, cand, start=0, length=None, chunk=1 << 20):
+    """Stream bytes of a candidate straight out of the image (entries joined end to end)."""
     import pycdlib
-    free = shutil.disk_usage(dest_dir).free
-    if free < cand.size * 1.05:
-        raise RuntimeError(f"Not enough free disk space for the temporary copy: "
-                           f"need {human_size(cand.size)}, have {human_size(free)}.")
-    ext = ".m2ts" if "M2TS" in cand.entries[0].upper() else ".vob"
-    out_path = os.path.join(dest_dir, "title" + ext)
+    end = cand.size if length is None else min(cand.size, start + length)
     iso = pycdlib.PyCdlib()
     iso.open(image)
     try:
-        with open(out_path, "wb") as out:
-            writer = _ProgressWriter(out, cand.size, progress, cancel)
-            for entry in cand.entries:
-                iso.get_file_from_iso_fp(writer, blocksize=1 << 20, **{cand.fs: entry})
+        base = 0
+        for entry, size in zip(cand.entries, cand.sizes):
+            lo, hi = max(start, base), min(end, base + size)
+            if lo < hi:
+                with iso.open_file_from_iso(**{cand.fs: entry}) as f:
+                    f.seek(lo - base)
+                    left = hi - lo
+                    while left > 0:
+                        data = f.read(min(chunk, left))
+                        if not data:
+                            break
+                        left -= len(data)
+                        yield data
+            base += size
     finally:
         iso.close()
-    return out_path
+
+
+def dump_range(image, cand, start, length, path):
+    """Copy a small slice of the title to a file (used only for probing and speed tests)."""
+    with open(path, "wb") as out:
+        for data in iter_chunks(image, cand, start, length):
+            out.write(data)
+    return path
 
 
 # --------------------------------------------------------------------------- ffmpeg
 
-def _run_kwargs():
-    return dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                errors="replace", creationflags=NO_WINDOW)
-
-
 def probe(media):
     ffprobe = find_tool("ffprobe")
-    r = subprocess.run([ffprobe, "-v", "error", "-print_format", "json",
-                        "-show_format", "-show_streams", media],
+    r = subprocess.run([ffprobe, "-v", "error", "-probesize", "100M", "-analyzeduration", "100M",
+                        "-print_format", "json", "-show_format", "-show_streams", media],
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                        creationflags=NO_WINDOW)
     if r.returncode != 0:
@@ -224,9 +255,8 @@ def probe(media):
     if not video:
         raise RuntimeError("No video stream found.")
     audio = [s for s in info["streams"] if s["codec_type"] == "audio"]
+    subs = [s for s in info["streams"] if s["codec_type"] == "subtitle"]
     duration = float(info["format"].get("duration") or video.get("duration") or 0)
-    if duration <= 0:
-        raise RuntimeError("Could not determine the video length.")
     sar = video.get("sample_aspect_ratio", "1:1")
     try:
         a, b = (float(x) for x in sar.split(":"))
@@ -234,22 +264,30 @@ def probe(media):
     except ValueError:
         sar_val = 1.0
     return dict(duration=duration, width=int(video["width"]), height=int(video["height"]),
-                sar=sar_val, codec=video["codec_name"], audio_tracks=len(audio))
+                sar=sar_val, codec=video["codec_name"], audio_tracks=len(audio),
+                subtitles=[f"{s.get('tags', {}).get('language', '?')} ({s['codec_name']})" for s in subs])
 
 
-def build_cmd(media, out, quality, meta, start=None, length=None):
+def build_cmd(inp, out, quality, meta, start=None, length=None, sub=None):
+    """inp is a path, or 'pipe:0' when the title is streamed straight from the image."""
     preset, crf = QUALITY[quality]
     vf = ["yadif=mode=0:deint=interlaced"]                 # only touches frames flagged interlaced
     if abs(meta["sar"] - 1) > 0.01:                        # DVD anamorphic -> square pixels
         vf.append(f"scale=w='trunc(iw*{meta['sar']:.6f}/2)*2':h=ih:flags=lanczos,setsar=1")
-    cmd = [find_tool("ffmpeg"), "-hide_banner", "-y", "-nostdin"]
+    chain = ",".join(vf)
+    cmd = [find_tool("ffmpeg"), "-hide_banner", "-y", "-nostdin",
+           "-probesize", "100M", "-analyzeduration", "100M"]
     if start is not None:
         cmd += ["-ss", f"{start:.2f}"]
-    cmd += ["-i", media]
+    cmd += ["-i", inp]
     if length is not None:
         cmd += ["-t", f"{length:.2f}"]
-    cmd += ["-map", "0:v:0", "-map", "0:a?", "-sn", "-dn",
-            "-vf", ",".join(vf),
+    if sub is None:
+        cmd += ["-map", "0:v:0", "-vf", chain]
+    else:                                                  # burn the chosen subtitle track into the picture
+        cmd += ["-filter_complex", f"[0:v:0][0:s:{sub}]overlay=format=auto[ov];[ov]{chain}[vout]",
+                "-map", "[vout]"]
+    cmd += ["-map", "0:a?", "-sn", "-dn",
             "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
             "-profile:v", "high", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "320k",
@@ -258,41 +296,98 @@ def build_cmd(media, out, quality, meta, start=None, length=None):
     return cmd
 
 
-def run_ffmpeg(cmd, duration, on_progress, cancel):
-    """Run ffmpeg, report (fraction, speed) and return when done. Raises on failure."""
-    proc = subprocess.Popen(cmd, **_run_kwargs())
-    tail = []
+def run_ffmpeg(cmd, on_progress, cancel, duration=None, feed=None, feed_total=1):
+    """Run ffmpeg and report progress as a 0..1 fraction. With feed (a chunk iterator) the data
+    is piped into ffmpeg's stdin and progress is measured in bytes; otherwise by output time."""
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if feed else None, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, creationflags=NO_WINDOW)   # binary: stdin carries video
+    lines = io.TextIOWrapper(proc.stdout, errors="replace")
+    tail, feed_err = [], []
+
+    def feeder():
+        done = 0
+        try:
+            for data in feed:
+                if cancel.is_set():
+                    break
+                proc.stdin.write(data)
+                done += len(data)
+                on_progress(min(done / feed_total, 0.999))
+        except (BrokenPipeError, OSError):
+            pass                                           # ffmpeg exited; its own error is reported below
+        except Exception as e:  # noqa: BLE001
+            feed_err.append(e)
+            proc.kill()
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    t = threading.Thread(target=feeder, daemon=True) if feed else None
+    if t:
+        t.start()
     try:
-        for line in proc.stdout:
+        for line in lines:
             if cancel.is_set():
                 proc.kill()
-                raise Cancelled()
+                break
             line = line.strip()
             m = re.match(r"out_time_(?:us|ms)=(\d+)", line)
             if m:
-                on_progress(min(int(m.group(1)) / 1e6 / duration, 1.0))
+                if duration:
+                    on_progress(min(int(m.group(1)) / 1e6 / duration, 1.0))
             elif "=" not in line or " " in line.split("=", 1)[0]:
                 tail = (tail + [line])[-15:]
         proc.wait()
     finally:
         if proc.poll() is None:
             proc.kill()
+    if cancel.is_set():
+        raise Cancelled()
+    if feed_err:
+        raise feed_err[0]
     if proc.returncode != 0:
         raise RuntimeError("ffmpeg failed:\n" + "\n".join(tail))
+    on_progress(1.0)
 
 
-def benchmark(media, meta, quality, workdir, cancel):
-    """Encode a short sample with the real settings -> (seconds per video second, bytes per video second)."""
-    dur = meta["duration"]
-    length = min(SAMPLE_SECONDS, dur)
-    start = max(0, dur / 2 - length / 2) if dur > 2 * SAMPLE_SECONDS else 0
+def benchmark(image, cand, meta, quality, workdir, cancel):
+    """Encode a short sample with the real settings.
+    Returns seconds-of-video, wall seconds, output bytes and source bytes of the sample."""
     sample = os.path.join(workdir, "sample.mp4")
-    t0 = time.monotonic()
-    run_ffmpeg(build_cmd(media, sample, quality, meta, start, length), length, lambda f: None, cancel)
+    if cand.fs == "plain":
+        dur = meta["duration"]
+        length = min(SAMPLE_SECONDS, dur)
+        start = max(0, dur / 2 - length / 2) if dur > 2 * SAMPLE_SECONDS else 0
+        t0 = time.monotonic()
+        run_ffmpeg(build_cmd(cand.entries[0], sample, quality, meta, start, length), lambda f: None, cancel,
+                   duration=length)
+        vsec, src = length, length * cand.size / dur
+    else:
+        want = min(cand.size, SAMPLE_MB << 20)
+        start = max(0, (cand.size - want) // 2) // 6144 * 6144   # 6144 = DVD sector x Blu-ray packet
+        piece = dump_range(image, cand, start, want, os.path.join(workdir, "sample.bin"))
+        t0 = time.monotonic()
+        run_ffmpeg(build_cmd(piece, sample, quality, meta), lambda f: None, cancel)
+        vsec, src = probe(sample)["duration"], want
+        os.remove(piece)
     wall = time.monotonic() - t0
-    size = os.path.getsize(sample)
+    out = os.path.getsize(sample)
     os.remove(sample)
-    return wall / length, size / length
+    if vsec <= 0:
+        raise RuntimeError("The speed test produced no video. Is this a playable title?")
+    return dict(vsec=vsec, wall=wall, out=out, src=src)
+
+
+def encode_title(image, cand, out, quality, meta, sub, on_progress, cancel):
+    """Convert one title. Disc titles are streamed from the image into ffmpeg, no temporary copy."""
+    if cand.fs == "plain":
+        cmd = build_cmd(cand.entries[0], out, quality, meta, sub=sub)
+        run_ffmpeg(cmd, on_progress, cancel, duration=meta["duration"])
+    else:
+        cmd = build_cmd("pipe:0", out, quality, meta, sub=sub)
+        run_ffmpeg(cmd, on_progress, cancel, feed=iter_chunks(image, cand), feed_total=cand.size)
 
 
 def unique_path(path):
@@ -312,14 +407,14 @@ def main():
 
     root = tk.Tk()
     root.title(APP_NAME)
-    root.geometry("720x520")
-    root.minsize(640, 480)
+    root.geometry("720x560")
+    root.minsize(640, 520)
     ttk.Style().configure("Big.TButton", font=("Segoe UI", 12, "bold"), padding=10)
     ttk.Style().configure("Head.TLabel", font=("Segoe UI", 15, "bold"))
 
     ui = queue.Queue()                    # callables to run on the Tk thread
     cancel = threading.Event()
-    state = dict(image=None, cands=[], media=None, meta=None, rate=None, tmp=None, busy=False)
+    state = dict(image=None, cands=[], jobs=[], meta=None, bench=None, tmp=None)
 
     def pump():
         while True:
@@ -365,31 +460,37 @@ def main():
     t1 = tabs[0]
     ttk.Label(t1, text="Choose your ripped disc image", style="Head.TLabel").pack(anchor="w")
     ttk.Label(t1, text="DVD or Blu-ray .iso / .img (or any video file).",
-              foreground="#555").pack(anchor="w", pady=(0, 12))
+              foreground="#555").pack(anchor="w", pady=(0, 10))
     ttk.Button(t1, text="📂  Upload disc image…", style="Big.TButton",
                command=lambda: pick_image()).pack(anchor="w")
     file_var = tk.StringVar(value="No file chosen")
-    ttk.Label(t1, textvariable=file_var, wraplength=640).pack(anchor="w", pady=(8, 14))
+    ttk.Label(t1, textvariable=file_var, wraplength=640).pack(anchor="w", pady=(8, 10))
+
+    ttk.Label(t1, text="Titles to convert (Ctrl/Shift-click for several):").pack(anchor="w")
+    lb_frame = ttk.Frame(t1)
+    lb_frame.pack(fill="x")
+    title_lb = tk.Listbox(lb_frame, selectmode="extended", height=5, exportselection=False)
+    title_lb.pack(side="left", fill="x", expand=True)
+    ttk.Button(lb_frame, text="Select all", command=lambda: title_lb.select_set(0, "end")
+               ).pack(side="left", padx=8, anchor="n")
 
     form = ttk.Frame(t1)
-    form.pack(fill="x")
+    form.pack(fill="x", pady=8)
     form.columnconfigure(1, weight=1)
-    title_var, out_var = tk.StringVar(), tk.StringVar()
+    out_var = tk.StringVar()
     qual_var = tk.StringVar(value=next(iter(QUALITY)))
-    ttk.Label(form, text="Movie / title:").grid(row=0, column=0, sticky="w", pady=4)
-    title_box = ttk.Combobox(form, textvariable=title_var, state="disabled")
-    title_box.grid(row=0, column=1, columnspan=2, sticky="ew", padx=8)
-    ttk.Label(form, text="Quality:").grid(row=1, column=0, sticky="w", pady=4)
+    ttk.Label(form, text="Quality:").grid(row=0, column=0, sticky="w", pady=4)
     ttk.Combobox(form, textvariable=qual_var, values=list(QUALITY), state="readonly"
-                 ).grid(row=1, column=1, columnspan=2, sticky="ew", padx=8)
-    ttk.Label(form, text="Save MP4 as:").grid(row=2, column=0, sticky="w", pady=4)
-    ttk.Entry(form, textvariable=out_var).grid(row=2, column=1, sticky="ew", padx=8)
-    ttk.Button(form, text="Browse…", command=lambda: pick_output()).grid(row=2, column=2)
+                 ).grid(row=0, column=1, columnspan=2, sticky="ew", padx=8)
+    ttk.Label(form, text="Save MP4 as:").grid(row=1, column=0, sticky="w", pady=4)
+    ttk.Entry(form, textvariable=out_var).grid(row=1, column=1, sticky="ew", padx=8)
+    ttk.Button(form, text="Browse…", command=lambda: pick_output()).grid(row=1, column=2)
     next_btn = ttk.Button(t1, text="Next ▸  Estimate time", style="Big.TButton",
                           state="disabled", command=lambda: start_estimate())
     next_btn.pack(side="bottom", anchor="e")
-    ttk.Label(t1, text="Tip: 'Highest' keeps all detail but takes longest; DVD/Blu-ray copy protection "
-                       "is not removed.", foreground="#777", wraplength=640).pack(side="bottom", anchor="w", pady=6)
+    ttk.Label(t1, text="Several titles are saved as 'name - title 1.mp4', 'name - title 2.mp4'… "
+                       "Copy-protected discs must be decrypted first.",
+              foreground="#777", wraplength=640).pack(side="bottom", anchor="w", pady=6)
 
     def pick_image():
         p = filedialog.askopenfilename(title="Choose disc image", filetypes=[
@@ -400,7 +501,7 @@ def main():
         state["image"] = p
         file_var.set(f"{p}\nReading disc…")
         next_btn.config(state="disabled")
-        title_box.config(state="disabled")
+        title_lb.delete(0, "end")
         result = {}
 
         def job():
@@ -410,8 +511,9 @@ def main():
         def done():
             state["cands"] = result["c"]
             file_var.set(f"{p}\n({human_size(os.path.getsize(p))})")
-            title_box.config(values=[c.label for c in state["cands"]], state="readonly")
-            title_box.current(0)
+            for c in state["cands"]:
+                title_lb.insert("end", c.label)
+            title_lb.select_set(0)
             out_var.set(unique_path(str(Path(p).with_suffix(".mp4"))))
             next_btn.config(state="normal")
 
@@ -436,11 +538,15 @@ def main():
     est_bar = ttk.Progressbar(t2, mode="determinate", maximum=100)
     est_bar.pack(fill="x", pady=4)
     est_info = tk.StringVar()
-    ttk.Label(t2, textvariable=est_info, font=("Segoe UI", 12), justify="left").pack(anchor="w", pady=14)
+    ttk.Label(t2, textvariable=est_info, font=("Segoe UI", 12), justify="left").pack(anchor="w", pady=10)
+    sub_var = tk.StringVar()
+    sub_row = ttk.Frame(t2)
+    ttk.Label(sub_row, text="Subtitles (burned in):").pack(side="left")
+    sub_box = ttk.Combobox(sub_row, textvariable=sub_var, state="readonly", width=40)
+    sub_box.pack(side="left", padx=8)
     est_btns = ttk.Frame(t2)
     est_btns.pack(side="bottom", fill="x")
-    est_back = ttk.Button(est_btns, text="◂ Back", command=lambda: back_to_upload())
-    est_back.pack(side="left")
+    ttk.Button(est_btns, text="◂ Back", command=lambda: back_to_upload()).pack(side="left")
     start_btn = ttk.Button(est_btns, text="Start converting ▸", style="Big.TButton",
                            state="disabled", command=lambda: start_convert())
     start_btn.pack(side="right")
@@ -461,16 +567,29 @@ def main():
                                        "'ffmpeg' and 'ffprobe' are on your PATH.")
         return False
 
+    def output_paths(n):
+        out = out_var.get()
+        if n == 1:
+            return [out]
+        base, ext = os.path.splitext(out)
+        return [unique_path(f"{base} - title {i + 1}{ext}") for i in range(n)]
+
     def start_estimate():
         ok = ensure_ffmpeg()
         if not ok:
             return
+        sel = list(title_lb.curselection())
+        if not sel:
+            messagebox.showinfo(APP_NAME, "Select at least one title.")
+            return
         cancel.clear()
         cleanup_tmp()
         state["tmp"] = tempfile.mkdtemp(prefix="iso2mp4_")
-        cand = state["cands"][title_box.current()]
+        jobs = [state["cands"][i] for i in sel]
+        state["jobs"] = jobs
         quality = qual_var.get()
         est_info.set("")
+        sub_row.pack_forget()
         est_bar.config(mode="determinate", value=0)
         start_btn.config(state="disabled")
         goto(1)
@@ -489,32 +608,43 @@ def main():
                 post(lambda: setp("Downloading ffmpeg (one time)…", 0))
                 download_ffmpeg(lambda d, t: post(lambda: setp(
                     f"Downloading ffmpeg… {human_size(d)}", 100 * d / t if t else None)))
-            if cand.fs != "plain":
-                post(lambda: setp("Reading the movie off the disc image…", 0))
-                media = extract(state["image"], cand, state["tmp"],
-                                lambda f: post(lambda: setp(
-                                    f"Reading the movie off the disc image… {f:.0%}", f * 100)), cancel)
-            else:
-                media = cand.entries[0]
+            main = jobs[0]
             post(lambda: setp("Analyzing video…"))
-            meta = probe(media)
+            if main.fs == "plain":
+                meta = probe(main.entries[0])
+                if meta["duration"] <= 0:
+                    raise RuntimeError("Could not determine the video length.")
+            else:
+                head = dump_range(state["image"], main, 0, min(main.size, HEAD_MB << 20),
+                                  os.path.join(state["tmp"], "head.bin"))
+                meta = probe(head)
+                os.remove(head)
             post(lambda: setp("Testing encode speed on a short sample…"))
-            spv, bpv = benchmark(media, meta, quality, state["tmp"], cancel)
-            state.update(media=media, meta=meta, rate=(spv, bpv))
+            bench = benchmark(state["image"], main, meta, quality, state["tmp"], cancel)
+            state.update(meta=meta, bench=bench)
             post(show_estimate)
 
         def show_estimate():
-            meta, (spv, bpv) = state["meta"], state["rate"]
+            meta, b = state["meta"], state["bench"]
+            total = sum(c.size for c in jobs)
+            secs = total * b["vsec"] / b["src"]            # video length, all selected titles
+            wall = total * b["wall"] / b["src"]
+            size = total * b["out"] / b["src"]
             est_bar.stop()
             est_bar.config(mode="determinate", value=100)
             est_status.set("Ready. Here is what to expect:")
+            outs = output_paths(len(jobs))
             est_info.set(
-                f"Movie length:      {human_time(meta['duration'])}\n"
+                f"Titles:                  {len(jobs)}  (video length about {human_time(secs)})\n"
                 f"Source:                 {meta['width']}×{meta['height']} ({meta['codec']}), "
                 f"{meta['audio_tracks']} audio track(s)\n"
-                f"Estimated time:   about {human_time(spv * meta['duration'])}\n"
-                f"Estimated size:    about {human_size(bpv * meta['duration'])}\n\n"
-                f"Output: {out_var.get()}")
+                f"Estimated time:   about {human_time(wall)}\n"
+                f"Estimated size:    about {human_size(size)}\n\n"
+                f"Output: {outs[0]}{'  (+%d more)' % (len(outs) - 1) if len(outs) > 1 else ''}")
+            choices = ["None"] + [f"Track {i + 1}: {s}" for i, s in enumerate(meta["subtitles"])]
+            sub_box.config(values=choices)
+            sub_box.current(0)
+            sub_row.pack(anchor="w", pady=6)
             start_btn.config(state="normal")
 
         def err(msg):
@@ -553,47 +683,65 @@ def main():
         folder_btn.pack_forget()
         again_btn.pack_forget()
         file_var.set("No file chosen")
+        title_lb.delete(0, "end")
         next_btn.config(state="disabled")
         goto(0)
 
     def start_convert():
-        out = out_var.get()
-        final_tmp = out + ".partial.mp4"
+        jobs, meta = state["jobs"], state["meta"]
+        outs = output_paths(len(jobs))
+        sub = sub_box.current() - 1 if sub_box.current() > 0 else None
+        quality = qual_var.get()
+        total = sum(c.size for c in jobs)
         cancel.clear()
         cancel_btn.pack(side="left")
         folder_btn.pack_forget()
         again_btn.pack_forget()
         conv_bar.config(value=0)
-        conv_status.set("Converting… keep this window open.")
         conv_info.set("")
         goto(2)
-        meta, started = state["meta"], time.monotonic()
+        started = time.monotonic()
+        finished = []
 
-        def on_progress(frac):
-            elapsed = time.monotonic() - started
-            eta = elapsed / frac * (1 - frac) if frac > 0.01 else None
-            post(lambda: (conv_bar.config(value=frac * 100), conv_info.set(
-                f"{frac:.1%} done\nElapsed: {human_time(elapsed)}\n"
-                f"Remaining: {human_time(eta) if eta is not None else 'calculating…'}")))
+        def make_cb(i, before):
+            def on_progress(frac):
+                overall = (before + frac * jobs[i].size) / total
+                elapsed = time.monotonic() - started
+                eta = elapsed / overall * (1 - overall) if overall > 0.01 else None
+                post(lambda: (conv_bar.config(value=overall * 100), conv_status.set(
+                    f"Converting title {i + 1} of {len(jobs)}… keep this window open."), conv_info.set(
+                    f"{overall:.1%} done\nElapsed: {human_time(elapsed)}\n"
+                    f"Remaining: {human_time(eta) if eta is not None else 'calculating…'}")))
+            return on_progress
 
         def job():
-            cmd = build_cmd(state["media"], final_tmp, qual_var.get(), meta)
-            run_ffmpeg(cmd, meta["duration"], on_progress, cancel)
-            os.replace(final_tmp, out)
+            before = 0
+            for i, (cand, out) in enumerate(zip(jobs, outs)):
+                part = out + ".partial.mp4"
+                try:
+                    m = meta if i == 0 else (probe(cand.entries[0]) if cand.fs == "plain" else meta)
+                    encode_title(state["image"], cand, part, quality, m, sub, make_cb(i, before), cancel)
+                    os.replace(part, out)
+                except BaseException:
+                    Path(part).unlink(missing_ok=True)
+                    raise
+                finished.append(out)
+                before += cand.size
             post(done)
 
         def done():
             cleanup_tmp()
             conv_bar.config(value=100)
             conv_status.set("✅ Finished!")
-            conv_info.set(f"Saved to:\n{out}\n\nSize: {human_size(os.path.getsize(out))}\n"
+            names = "\n".join(finished)
+            conv_info.set(f"Saved:\n{names}\n\nTotal size: "
+                          f"{human_size(sum(os.path.getsize(f) for f in finished))}\n"
                           f"Took: {human_time(time.monotonic() - started)}")
             cancel_btn.pack_forget()
             folder_btn.pack(side="left")
             again_btn.pack(side="right")
 
         def err(msg):
-            Path(final_tmp).unlink(missing_ok=True)
             cleanup_tmp()
             conv_status.set("Cancelled." if msg is None else "Something went wrong.")
             if msg:
