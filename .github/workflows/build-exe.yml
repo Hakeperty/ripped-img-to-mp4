@@ -1,0 +1,26 @@
+name: Build Windows exe
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch ffmpeg to bundle
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip -OutFile ff.zip
+          Expand-Archive ff.zip ff
+          Copy-Item ff\*\bin\ffmpeg.exe, ff\*\bin\ffprobe.exe .
+      - run: .\build_exe.bat
+        shell: cmd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ISO-to-MP4-windows
+          path: dist/ISO-to-MP4.exe
