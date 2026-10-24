@@ -36,4 +36,8 @@ Disc images are read directly (no mounting, no admin rights) and the title is **
 ## Limits
 
 - Copy-protected (still encrypted) discs are not supported – this tool doesn't bypass disc encryption, so use an image that is already decrypted.
-- Menus and extras beyond the listed titles are not included. Subtitle burn-in has not been tested against a real disc yet.
+- Menus and extras beyond the listed titles are not included. 
+
+## Test results
+
+Checked on generated disc images (DVD title sets with a bitmap subtitle track, a two-clip Blu-ray playlist, a two-title DVD), driving the real GUI. Pictures are in `docs/test-results/`: converted frames (`frame_*.png`, including burned-in subtitle and the second stitched Blu-ray clip) and GUI screenshots (`gui_*.png`). Estimates came out close to reality (e.g. predicted 15 s / 2.7 MB, actual 20 s / 2.4 MB).

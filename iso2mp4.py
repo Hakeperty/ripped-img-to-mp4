@@ -537,8 +537,13 @@ def main():
     ttk.Label(t2, textvariable=est_status, wraplength=640).pack(anchor="w", pady=(8, 4))
     est_bar = ttk.Progressbar(t2, mode="determinate", maximum=100)
     est_bar.pack(fill="x", pady=4)
-    est_info = tk.StringVar()
-    ttk.Label(t2, textvariable=est_info, font=("Segoe UI", 12), justify="left").pack(anchor="w", pady=10)
+    est_grid = ttk.Frame(t2)
+    est_grid.pack(anchor="w", pady=10)
+    est_vars = {k: tk.StringVar() for k in ("Titles", "Source", "Estimated time", "Estimated size", "Output")}
+    for r, (k, v) in enumerate(est_vars.items()):
+        ttk.Label(est_grid, text=k + ":", font=("Segoe UI", 12, "bold")).grid(row=r, column=0, sticky="nw", padx=(0, 14))
+        ttk.Label(est_grid, textvariable=v, font=("Segoe UI", 12), wraplength=480, justify="left"
+                  ).grid(row=r, column=1, sticky="w")
     sub_var = tk.StringVar()
     sub_row = ttk.Frame(t2)
     ttk.Label(sub_row, text="Subtitles (burned in):").pack(side="left")
@@ -588,7 +593,8 @@ def main():
         jobs = [state["cands"][i] for i in sel]
         state["jobs"] = jobs
         quality = qual_var.get()
-        est_info.set("")
+        for v in est_vars.values():
+            v.set("")
         sub_row.pack_forget()
         est_bar.config(mode="determinate", value=0)
         start_btn.config(state="disabled")
@@ -634,13 +640,12 @@ def main():
             est_bar.config(mode="determinate", value=100)
             est_status.set("Ready. Here is what to expect:")
             outs = output_paths(len(jobs))
-            est_info.set(
-                f"Titles:                  {len(jobs)}  (video length about {human_time(secs)})\n"
-                f"Source:                 {meta['width']}×{meta['height']} ({meta['codec']}), "
-                f"{meta['audio_tracks']} audio track(s)\n"
-                f"Estimated time:   about {human_time(wall)}\n"
-                f"Estimated size:    about {human_size(size)}\n\n"
-                f"Output: {outs[0]}{'  (+%d more)' % (len(outs) - 1) if len(outs) > 1 else ''}")
+            est_vars["Titles"].set(f"{len(jobs)}  (video length about {human_time(secs)})")
+            est_vars["Source"].set(f"{meta['width']}×{meta['height']} ({meta['codec']}), "
+                                   f"{meta['audio_tracks']} audio track(s)")
+            est_vars["Estimated time"].set(f"about {human_time(wall)}")
+            est_vars["Estimated size"].set(f"about {human_size(size)}")
+            est_vars["Output"].set(outs[0] + (f"  (+{len(outs) - 1} more)" if len(outs) > 1 else ""))
             choices = ["None"] + [f"Track {i + 1}: {s}" for i, s in enumerate(meta["subtitles"])]
             sub_box.config(values=choices)
             sub_box.current(0)
